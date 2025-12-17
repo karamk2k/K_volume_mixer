@@ -2,6 +2,9 @@
 use std::collections::HashMap;
 use std::process::Command;
 use std::str;
+use std::sync::mpsc::{channel, Receiver};
+use std::thread;
+use std::time::Duration;
 
 use eframe::egui;
 
@@ -19,6 +22,7 @@ struct MyApp {
     per_app_volumes: HashMap<u32, f32>,          // pid -> volume in percent
     vol: f32,                                    // main vol
     last_update: std::time::Instant,
+    update_rx: Receiver<HashMap<u32, HashMap<String, String>>>,
 }
 
 impl Default for MyApp {
@@ -28,11 +32,24 @@ impl Default for MyApp {
             None => 0.0,
         };
 
+        let (tx, rx) = channel();
+
+        // Spawn a background thread that polls `pactl` every second and sends results.
+        thread::spawn(move || loop {
+            let apps = parse_sink_inputs();
+            // best-effort send; if receiver was dropped, stop the thread
+            if tx.send(apps).is_err() {
+                break;
+            }
+            thread::sleep(Duration::from_secs(1));
+        });
+
         Self {
             apps: HashMap::new(),
             per_app_volumes: HashMap::new(),
             vol,
             last_update: std::time::Instant::now(),
+            update_rx: rx,
         }
     }
 }
@@ -40,16 +57,34 @@ impl Default for MyApp {
 
 impl eframe::App for MyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let now = std::time::Instant::now();
-        if now.duration_since(self.last_update).as_secs() > 1 {
-            self.refresh_apps();
-            self.last_update = now;
+        // Drain any background updates and apply the latest state.
+        for apps in self.update_rx.try_iter() {
+            self.apps = apps;
+            // Update per-app volumes from latest apps snapshot
+            self.per_app_volumes.clear();
+            for (pid, data) in &self.apps {
+                if let Some(vol_str) = data.get("Volume") {
+                    if let Some(first_percent) = vol_str.split('/').nth(1) {
+                        if let Some(percent_str) = first_percent.trim().strip_suffix('%') {
+                            if let Ok(percent) = percent_str.trim().parse::<f32>() {
+                                self.per_app_volumes.insert(*pid, percent);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Also refresh system volume when we have new data
+            if let Some(sys_v) = get_system_volume() {
+                self.vol = sys_v;
+            }
+            self.last_update = std::time::Instant::now();
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("🎧 System Volume Controller");
 
-            // System Volume Slider
+        
             ui.group(|ui| {
                 ui.label("🔊 System Volume:");
                 let slider = ui.add(egui::Slider::new(&mut self.vol, 0.0..=100.0).text("%"));
@@ -62,15 +97,36 @@ impl eframe::App for MyApp {
 
             // App Sliders
             ui.label("🎶 Application Volumes:");
-            for (pid, props) in &self.apps {
-                let unknown="Unknown".to_string();
-                let name = props.get("application.name").unwrap_or(&unknown);
+            // Iterate in a stable, sorted order to avoid widgets jumping positions
+            let mut pids: Vec<u32> = self.apps.keys().cloned().collect();
+            pids.sort();
+            for pid in pids {
+                let props = &self.apps[&pid];
+                let unknown = "Unknown".to_string();
+                // Prefer a more descriptive title when present (tab/page title or media name)
+                let primary = props
+                    .get("media.name")
+                    .or_else(|| props.get("application.name"))
+                    .or_else(|| props.get("application.process.binary"))
+                    .unwrap_or(&unknown);
                 ui.group(|ui| {
-                    ui.label(format!("{} (pid: {})", name, pid));
-                    if let Some(vol) = self.per_app_volumes.get_mut(pid) {
+                    ui.label(format!("{} (pid: {})", primary, pid));
+                    // Show secondary info when available and different from primary
+                    if let Some(app_name) = props.get("application.name") {
+                        if app_name != primary {
+                            ui.label(format!("App: {}", app_name));
+                        }
+                    }
+                    if let Some(media_title) = props.get("media.name") {
+                        if media_title != primary {
+                            ui.label(format!("Title: {}", media_title));
+                        }
+                    }
+
+                    if let Some(vol) = self.per_app_volumes.get_mut(&pid) {
                         let slider = ui.add(egui::Slider::new(vol, 0.0..=100.0).text("%"));
                         if slider.changed() {
-                            set_app_volume(*pid, *vol);
+                            set_app_volume(pid, *vol);
                         }
                     } else {
                         ui.label("No volume data.");
@@ -93,13 +149,9 @@ fn set_app_volume(index: u32, vol: f32) {
 
    let id_str=index.to_string();
 
-   let output = Command::new("pactl")
+   let _ = Command::new("pactl")
         .args(&["set-sink-input-volume", &id_str, &format!("{}%",vol)])
         .output();
-
-
-
-
     }
 
 
@@ -117,7 +169,7 @@ fn get_system_volume() -> Option<f32> {
 
         if let Some(volume_str) = parts.last() {
             if let Ok(volume) = volume_str.parse::<f32>() {
-              //  println!("Parsed volume: {}", volume);
+           
                 return Some(volume * 100.0); // as percentage
             }
         }
